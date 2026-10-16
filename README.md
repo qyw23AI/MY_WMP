@@ -5,6 +5,14 @@ Code for the paper:
 [Hang Lai](https://apex.sjtu.edu.cn/members/laihang@apexlab.org), [Jiahang Cao](https://apex.sjtu.edu.cn/members/jhcao@apexlab.org), [JiaFeng Xu](https://scholar.google.com/citations?user=GPmUxtIAAAAJ&hl=zh-CN&oi=ao), [Hongtao Wu](https://scholar.google.com/citations?user=7u0TYgIAAAAJ&hl=zh-CN&oi=ao), [Yunfeng Lin](https://apex.sjtu.edu.cn/members/yflin@apexlab.org), [Tao Kong](https://www.taokong.org/), [Yong Yu](https://scholar.google.com.hk/citations?user=-84M1m0AAAAJ&hl=zh-CN&oi=ao), [Weinan Zhang](https://wnzhang.net/) 
 
 ### [🌐 Project Website](https://wmp-loco.github.io/) | [📄 Paper](https://arxiv.org/abs/2409.16784)
+
+## Isaac Lab migration for RTX 5060 Ti
+
+The original Isaac Gym implementation remains in `legged_gym/`, `rsl_rl/`, and `dreamer/`. An independent Isaac Lab port and its local usage notes are in [`isaaclab_migration/`](isaaclab_migration/README.md). The port reuses the original A1 asset, policy, AMP and world-model architecture, while adapting the simulator, depth acquisition, trajectory storage and checkpoints.
+
+For the tested 2048-robot / 512-depth-camera setup, run `./isaaclab_migration/paper_2048.sh --iterations 10000` from the repository root. Its geometric depth backend and Isaac Lab physics differ from the paper's Isaac Gym setup; the completed short runs establish training stability, not paper-level locomotion performance. Training outputs and generated USD assets stay local and are excluded from Git.
+
+Project layout: `legged_gym/` contains the original simulator environment and A1 configuration; `rsl_rl/` contains PPO, AMP, the runner and policy modules; `dreamer/` contains the world model; `resources/` and `datasets/` contain the A1 asset and motion data; `isaaclab_migration/` contains the new Isaac Lab environment, runner adapter, launch scripts and validation notes.
    
 ## Requirements
 1. Create a new python virtual env with python 3.6, 3.7 or 3.8 (3.8 recommended)
