@@ -23,7 +23,7 @@ def color_terrain(color):
 
 
 class ViewportCapture:
-    def __init__(self, directory, every_steps=100):
+    def __init__(self, directory, every_steps=100, follow_camera=False, fps=None):
         from omni.kit.viewport.utility import get_active_viewport
         self.viewport = get_active_viewport()
         if self.viewport is None:
@@ -31,32 +31,21 @@ class ViewportCapture:
         self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=True)
         self.every_steps = every_steps
+        self.fps = fps
+        self.follow_camera = follow_camera
         self.step_count = 0
-        self.pending = []
+        self.frame_count = 0
 
-    def on_step(self):
-        from omni.kit.viewport.utility import capture_viewport_to_file
-        self.step_count += 1
-        if self.step_count % self.every_steps == 0:
-            path = self.directory / f'frame_{self.step_count:06d}.png'
-            self.pending.append(capture_viewport_to_file(self.viewport, str(path)))
-
-    def capture_final(self, sim, filename='training.png'):
+    def _wait_for_capture(self, future, sim, path):
         import asyncio
         import time
-        from omni.kit.viewport.utility import capture_viewport_to_file
-        path = self.directory / filename
-        path.unlink(missing_ok=True)
-        future = capture_viewport_to_file(self.viewport, str(path))
         task = asyncio.ensure_future(future.wait_for_result())
-        deadline = time.monotonic() + 20
+        deadline = time.monotonic() + 30
         while not task.done() and time.monotonic() < deadline:
             sim.render()
         if not task.done():
             raise RuntimeError(f'Viewport capture timed out: {path}')
         task.result()
-        # Kit's capture future can resolve before the encoder finishes disk I/O.
-        # Wait for the PNG's final IEND chunk, not merely file creation.
         while time.monotonic() < deadline:
             try:
                 with path.open('rb') as stream:
@@ -68,3 +57,23 @@ class ViewportCapture:
             sim.render()
             time.sleep(.001)
         raise RuntimeError(f'Viewport PNG write timed out: {path}')
+
+    def on_step(self, env=None):
+        from omni.kit.viewport.utility import capture_viewport_to_file
+        self.step_count += 1
+        due = (self.step_count * self.fps // 50 > self.frame_count) if self.fps else (self.step_count % self.every_steps == 0)
+        if due:
+            if self.follow_camera:
+                if env is None or env.viewport_camera_controller is None:
+                    raise RuntimeError('Following camera requires a GUI environment')
+                env.viewport_camera_controller.update_view_to_asset_root('robot')
+                env.sim.render()
+            path = self.directory / f'frame_{self.step_count:06d}.png'
+            self._wait_for_capture(capture_viewport_to_file(self.viewport, str(path)), env.sim, path)
+            self.frame_count += 1
+
+    def capture_final(self, sim, filename='training.png'):
+        from omni.kit.viewport.utility import capture_viewport_to_file
+        path = self.directory / filename
+        path.unlink(missing_ok=True)
+        return self._wait_for_capture(capture_viewport_to_file(self.viewport, str(path)), sim, path)

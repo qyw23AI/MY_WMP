@@ -51,8 +51,8 @@ def make_env_cfg(legacy, stage=3, device='cuda:0'):
     c.robot=ArticulationCfg(
         prim_path='/World/envs/env_.*/Robot',
         spawn=sim_utils.UrdfFileCfg(asset_path=str(path),
-            usd_dir=str(ROOT/'isaaclab_migration/.cache'/path.stem),
-            make_instanceable=False,fix_base=legacy.asset.fix_base_link,merge_fixed_joints=legacy.asset.collapse_fixed_joints,
+            usd_dir=str(ROOT/'isaaclab_migration/.cache'/(path.stem+'_instanced')),
+            make_instanceable=True,fix_base=legacy.asset.fix_base_link,merge_fixed_joints=legacy.asset.collapse_fixed_joints,
             root_link_name=root_link,activate_contact_sensors=True,
             self_collision=legacy.asset.self_collisions==0,
             replace_cylinders_with_capsules=legacy.asset.replace_cylinder_with_capsule,

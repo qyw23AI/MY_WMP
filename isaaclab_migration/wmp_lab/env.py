@@ -44,15 +44,21 @@ class WMPEnv(DirectRLEnv):
     def _setup_scene(self):
         count=self.cfg.legacy.depth.camera_num_envs
         proportions=self.cfg.legacy.terrain.terrain_proportions
-        tilt_start=math.ceil(self.num_envs*sum(proportions[:7]))
-        crawl_end=math.ceil(self.num_envs*sum(proportions[:9]))
-        required=np.arange(tilt_start,crawl_end)
-        if count<len(required):raise ValueError(f'{count} cameras cannot cover {len(required)} tilt/crawl environments')
-        if count==self.num_envs:chosen=np.arange(self.num_envs)
-        else:
-            if count==len(required):raise ValueError('RTX subset must include source environment 0 as well as tilt/crawl environments')
-            other=np.concatenate(([0],np.random.choice(np.arange(1,tilt_start),count-len(required)-1,replace=False)))
-            chosen=np.concatenate((np.sort(other),required))
+        from .competition import column_types, COMPETITION_TYPES
+        kinds=column_types(self.cfg.legacy.terrain)
+        cols=np.floor(np.arange(self.num_envs)/(self.num_envs/len(kinds))).astype(int)
+        if hasattr(self.cfg.legacy.terrain,'eval_terrain_col'):
+            if getattr(self.cfg.legacy.terrain,'competition',False):cols[:]=self.cfg.legacy.terrain.eval_terrain_col
+            else:cols=(np.arange(self.num_envs)+self.cfg.legacy.terrain.eval_terrain_col)%len(kinds)
+        # Preserve the original 25% camera coverage on competition courses.
+        # Tilt and crawl still require direct depth; other robots use the
+        # world-model depth predictor, including competition robots.
+        required=np.array([i for i,col in enumerate(cols) if kinds[col] in ('tilt','crawl')],dtype=np.int64)
+        if count<len(required):raise ValueError(f'{count} cameras cannot cover {len(required)} tilt/crawl environments; increase --camera_envs')
+        required=np.unique(np.append(required,0))
+        if count<len(required):raise ValueError('Camera subset must also include environment 0')
+        other=np.setdiff1d(np.arange(self.num_envs),required)
+        chosen=np.sort(np.concatenate((required,np.random.choice(other,count-len(required),replace=False))))
         self.camera_env_ids=torch.as_tensor(chosen,device=self.device,dtype=torch.long)
         self.camera_lookup=torch.full((self.num_envs,),-1,device=self.device,dtype=torch.long)
         self.camera_lookup[self.camera_env_ids]=torch.arange(count,device=self.device)
@@ -68,10 +74,8 @@ class WMPEnv(DirectRLEnv):
             create_prim_from_mesh('/World/ground',trimesh.Trimesh(vertices=v,faces=self.terrain.triangles,process=False),physics_material=self.cfg.sim.physics_material)
         # Original URDF contains an opaque visualization box centered at the camera.
         # RTX cameras see its inside; hide only that visual marker (no collision).
-        from pxr import Usd, UsdGeom
+        from pxr import Usd, UsdGeom, Sdf
         root=self.sim.stage.GetPrimAtPath('/World/envs/env_0/Robot')
-        for prim in list(Usd.PrimRange(root)):
-            if prim.IsInstance():prim.SetInstanceable(False)
         sim_utils.modify_collision_properties('/World/envs/env_0/Robot',sim_utils.CollisionPropertiesCfg(
             contact_offset=c.sim.physx.contact_offset,rest_offset=c.sim.physx.rest_offset))
         material=sim_utils.PreviewSurfaceCfg(diffuse_color=(.18,.22,.25),roughness=1.)
@@ -80,11 +84,17 @@ class WMPEnv(DirectRLEnv):
         cache=UsdGeom.XformCache()
         base=self.sim.stage.GetPrimAtPath('/World/envs/env_0/Robot/base')
         hidden=[]
-        for prim in list(Usd.PrimRange(root)):
+        for prim in list(Usd.PrimRange(root,Usd.TraverseInstanceProxies())):
             if prim.GetTypeName()=='Cube' and '/base/visuals/' in str(prim.GetPath()):
                 local=cache.ComputeRelativeTransform(prim,base)[0].ExtractTranslation()
                 if np.linalg.norm(np.array(local)-np.array([.27,0.,.03]))<1e-5:
-                    UsdGeom.Imageable(prim).MakeInvisible(); hidden.append(str(prim.GetPath()))
+                    if prim.IsInstanceProxy():
+                        # Edit the shared visual source once; keep base visuals/collisions instanced.
+                        spec=prim.GetPrimStack()[0]
+                        attr=spec.attributes.get('visibility') or Sdf.AttributeSpec(spec,'visibility',Sdf.ValueTypeNames.Token)
+                        attr.default='invisible'
+                    else:UsdGeom.Imageable(prim).MakeInvisible()
+                    hidden.append(str(prim.GetPath()))
         if len(hidden)!=1:raise RuntimeError(f'Expected one camera marker, got {hidden}')
         print('HIDDEN_CAMERA_VISUAL',hidden,flush=True)
         self.scene.clone_environments(copy_from_source=False); self.scene.filter_collisions(global_prim_paths=['/World/ground'])
@@ -183,7 +193,12 @@ class Adapter:
         self.env=env; self.cfg=env.cfg.legacy; self.capture=capture
         self.device=env.device; self.num_envs=env.num_envs; self.depth_index=env.camera_env_ids.cpu().numpy()
         self.depth_index_inverse=env.camera_lookup.cpu().numpy()
-        self.depth_index_without_crawl_tilt=self.depth_index[self.depth_index<env.core.tilt_start_idx]
+        if getattr(env.cfg.legacy.terrain,'competition',False):
+            kinds=env.terrain.column_types
+            self.depth_index_without_crawl_tilt=np.array([i for i in self.depth_index
+                if kinds[int(env.core.terrain_types[i])] not in ('tilt','crawl')],dtype=np.int64)
+        else:
+            self.depth_index_without_crawl_tilt=self.depth_index[self.depth_index<env.core.tilt_start_idx]
     @property
     def episode_length_buf(self):return self.env.episode_length_buf
     @episode_length_buf.setter
@@ -196,7 +211,7 @@ class Adapter:
     def step(self,actions):
         _,r,terminated,truncated,info=self.env.step(actions)
         if self.capture:
-            self.capture.on_step()
+            self.capture.on_step(self.env)
             if self.capture.step_count%self.capture.every_steps==0:
                 from PIL import Image
                 depth=self.env.core.depth_buffer[0,-2].detach().cpu().numpy()

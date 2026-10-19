@@ -83,6 +83,88 @@ python isaaclab_migration/tests/test_contract.py
 
 每个日志目录含 TensorBoard、配置、检查点、`validation.json`、实际深度预览 `depth.png` 和米制深度 `depth_meters.npy`。可视化目录保存实际视口PNG；回放还可保存同一时刻深度小图，用 `python isaaclab_migration/scripts/make_preview.py /absolute/capture_dir` 生成动态图。
 
+### 按检查点回看训练阶段
+
+无窗口的大规模训练不会在保存权重时录视频。训练结束后，可以逐个载入保存的 `model_*.pt`，在固定的障碍和速度指令下重新回放，比较策略随训练轮次的变化。批量回放所有检查点的命令如下：
+
+```bash
+conda activate wmp_lab
+cd /home/qyw/WMP
+python isaaclab_migration/scripts/record_checkpoints.py \
+  isaaclab_migration/logs/paper_2048 \
+  --output_dir isaaclab_migration/outputs/paper_2048_checkpoints \
+  --play_steps 1000 --terrain_col 10 --terrain_level 6 --forward_speed 0.5
+```
+
+查看某个阶段的视频：
+
+```bash
+xdg-open /home/qyw/WMP/isaaclab_migration/outputs/paper_2048_checkpoints/model_10000/preview.mp4
+```
+
+想现场打开仿真窗口，只回放一个检查点并录下画面，可以直接运行：
+
+```bash
+./isaaclab_migration/run.sh --play --num_envs 4 --camera_envs 4 \
+  --checkpoint /home/qyw/WMP/isaaclab_migration/logs/paper_2048/model_10000.pt \
+  --play_steps 1000 --follow_camera \
+  --eval_terrain_col 10 --eval_terrain_level 6 --fixed_forward_speed 0.5 \
+  --capture_every_steps 10 \
+  --capture_dir /home/qyw/WMP/isaaclab_migration/outputs/my_gap_replay \
+  --log_dir /home/qyw/WMP/isaaclab_migration/logs/my_gap_replay
+```
+
+结束后，将采样的 PNG 合成为视频：
+
+```bash
+python isaaclab_migration/scripts/make_preview.py \
+  /home/qyw/WMP/isaaclab_migration/outputs/my_gap_replay \
+  --frame_steps 10 --mp4_only
+xdg-open /home/qyw/WMP/isaaclab_migration/outputs/my_gap_replay/preview.mp4
+```
+
+每个检查点的输出目录包含 `preview.mp4`、采样画面 PNG、同步深度图、`log/state.csv` 和 `log/validation.json`。视频录制为 1000 个控制步（20 秒仿真）、5 帧/秒，镜头跟随首个机器人。CSV 记录速度、前进距离、地形级别及重置标记；验证 JSON 记录检查点加载核对、运行步数和显存峰值。已录制的视频默认跳过；指定 `--overwrite` 会重新录制。
+
+回放参数可按下面调整：
+
+- `--only 10000` 只回放 `model_10000.pt`；不指定时处理目录中的全部 `model_*.pt`。
+- `--play_steps 1000` 控制回放长度。A1 控制频率为 50 Hz，因此 1000 步等于 20 秒仿真；增加步数可以观察更长的地形通过过程。
+- `--terrain_col 10` 选择障碍类型，`--terrain_level 6` 选择难度（0–9）。列 10 是沟壑，15 是攀爬，17 是倾斜通道，18 是低矮通道。
+- `--forward_speed 0.5` 固定前进速度指令，单位为 m/s。比较不同检查点时应使用相同地形、难度、时长和速度。
+- `--num_envs 4` 控制同时显示的机器人数量；只有首个机器人用于 CSV 指标统计。
+- `--output_dir` 指定录像保存位置。换地形重新录制时使用不同目录，防止混淆。
+
+例如，只在低矮通道回放最终策略：
+
+```bash
+python isaaclab_migration/scripts/record_checkpoints.py \
+  isaaclab_migration/logs/paper_2048 --only 10000 \
+  --output_dir isaaclab_migration/outputs/paper_2048_crawl \
+  --terrain_col 18 --terrain_level 6 --forward_speed 0.5 --play_steps 1000
+```
+
+这些视频是从已保存检查点重新运行得到的评估回放，并非训练当时的原始画面。初始化地形、命令及录像参数保持一致，物理仿真仍有随机性，不能保证逐帧相同。训练与 GUI 回放同时使用显卡可能挤占 16 GiB 显存，因此建议训练结束后批量生成。
+
+### 本次 10000 轮训练的阶段回放
+
+2026-10-18 使用第 6 级间隙地形、0.5 m/s 前进指令、1000 步（20 秒仿真）回放了全部保存检查点。视频在 5 或 10 帧/秒下均为 20 秒，镜头持续跟随首个机器人。下表的“最远前进”和“重置”来自对应 `log/state.csv`，表示一次仿真结果，适合查看训练阶段趋势，不是统计成功率。
+
+| 迭代检查点 | 视频 | 最远前进 | 首个机器人重置 |
+| ---: | --- | ---: | ---: |
+| 1 | [preview.mp4](outputs/paper_2048_checkpoints/model_1/preview.mp4) | -0.41 m | 0 |
+| 1001 | [preview.mp4](outputs/paper_2048_checkpoints/model_1001/preview.mp4) | 2.06 m | 2 |
+| 2001 | [preview.mp4](outputs/paper_2048_checkpoints/model_2001/preview.mp4) | 2.33 m | 4 |
+| 3001 | [preview.mp4](outputs/paper_2048_checkpoints/model_3001/preview.mp4) | 4.44 m | 2 |
+| 4001 | [preview.mp4](outputs/paper_2048_checkpoints/model_4001/preview.mp4) | 11.65 m | 0 |
+| 5001 | [preview.mp4](outputs/paper_2048_checkpoints/model_5001/preview.mp4) | 10.67 m | 0 |
+| 6001 | [preview.mp4](outputs/paper_2048_checkpoints/model_6001/preview.mp4) | 10.37 m | 1 |
+| 7001 | [preview.mp4](outputs/paper_2048_checkpoints/model_7001/preview.mp4) | 10.80 m | 0 |
+| 8001 | [preview.mp4](outputs/paper_2048_checkpoints/model_8001/preview.mp4) | 10.07 m | 0 |
+| 9001 | [preview.mp4](outputs/paper_2048_checkpoints/model_9001/preview.mp4) | 11.65 m | 0 |
+| 10000 | [preview.mp4](outputs/paper_2048_checkpoints/model_10000/preview.mp4) | 11.08 m | 0 |
+
+最终策略在其他地形的录像也保存在 `outputs/paper_2048_{climb,tilt,crawl}/model_10000/preview.mp4`。这次单次回放结果：攀爬地形最远 4.68 m、重置 1 次；倾斜通道最远 5.15 m、重置 1 次；低矮通道最远 10.25 m、没有重置。每个目录都有对应 `log/state.csv` 和 `log/validation.json`。
+
 ## 物理差异与 D435i 后续
 
 Isaac Gym 与 Isaac Lab/Sim 的 PhysX、URDF导入、接触求解不同，无法保证相同动力学轨迹。本迁移用 Lab 足部净接触力替代 Gym 足部力传感器读数；采用相同奖励公式但底层测量实现不同。现有短训练只验收数值稳定、梯度更新、深度链路、保存恢复及可视化，不能证明论文级越障性能已复现。
@@ -133,3 +215,24 @@ cd /home/qyw/WMP
 2048/512、24 步的 21 轮完整配置实测通过：世界模型 150 次更新、深度预测器 2000 次更新、预测深度采样 1807 次，`16×64` 满批量反向传播通过；整卡峰值 10210 MiB，进程峰值内存 12760 MiB。24 步的 100 轮资源诊断最高 11682 MiB 显存、12551 MiB 进程内存，实际采到了完整 64 帧。48 步完整配置另测 21 轮通过：世界模型 180 次、深度预测器 2000 次、预测深度采样 2166 次；整卡峰值 10724 MiB，进程峰值内存 12558 MiB。48 步在早期实际采样最长 57 帧。RTX 路径在 1024 环境、128 路相机时已经触发系统内存 OOM，因此 2048/512 正式脚本仍使用几何深度；RTX 依靠 GPU 渲染，但 Isaac Sim 同时消耗大量系统内存。
 
 若更看重保持论文每环境 24 步，可运行 `./isaaclab_migration/paper_2048.sh --rollout_steps 24 --reward_schedule_scale 2 --iterations 20000`；这会使 PPO 每轮总样本和每轮环境步数变为论文的一半，而同等环境步数下的 PPO/世界模型更新次数变为两倍。两种方案均只做了短期稳定性验证，不能由此推断收敛质量或最终论文成绩。
+
+## ROBOCON 梅花桩、轮胎阵、高墙课程
+
+新增三类各10级的课程，9级为标准尺寸，支持单项、三类合训与原地形混合。课程成功率、标准强化采样、规则判定及使用命令见 [ROBOCON.md](ROBOCON.md)。
+
+只检查地形、不创建机器人或训练器：
+
+```bash
+./isaaclab_migration/preview_terrains.sh --level 9
+```
+
+在预览面板选择类型、0–9级并点击聚焦，可对比课程变化。确认地形后再使用 `run.sh --terrain robocon --competition_stage learn` 开始训练。
+### 手动录制每 300 轮的赛道回放
+
+训练仍按每 300 轮保存检查点。需要回放时，在系统终端执行：
+
+```bash
+./isaaclab_migration/record_course_checkpoints.sh /训练日志目录 1500
+```
+
+省略轮次会处理该目录下所有尚未完成的 300 轮检查点；先加 `--list` 可列出可用轮次。每个检查点单独录制梅花桩、轮胎阵、高墙的 L0 与 L9，共六段。视频为 20 fps、20 秒，与 50 Hz 仿真时间一致；相机位于机器人正后方朝向赛道。完成的视频和索引位于训练目录的 `checkpoint_videos/`，中断后重启脚本会跳过已验证完成的片段。运行回放前留出 GPU/内存余量，避免与大型训练同时占满资源。

@@ -356,9 +356,6 @@ class WMPRunner:
             learn_time = stop - start
             if self.log_dir is not None:
                 self.log(locals())
-            if it % self.save_interval == 0:
-                self.current_learning_iteration = it + 1
-                self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it+1)))
             ep_infos.clear()
 
 
@@ -375,6 +372,26 @@ class WMPRunner:
                 for name, values in wm_metrics.items():
                     self.writer.add_scalar('World_model/' + name, float(np.mean(values)), it)
             print('training world model time:', time.time() - start_time)
+            self.current_learning_iteration = it + 1
+            if (it + 1 - start_iter) % self.save_interval == 0:
+                self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it+1)))
+            callback = getattr(self, 'iteration_callback', None)
+            if callback is not None and callback(it + 1):
+                # Evaluation resets simulation episodes, but keeps completed WM replay and AMP replay.
+                obs = self.env.get_observations()
+                privileged_obs = self.env.get_privileged_observations()
+                critic_obs = privileged_obs if privileged_obs is not None else obs
+                amp_obs = self.env.get_amp_observations()
+                self.trajectory_history = torch.zeros_like(self.trajectory_history)
+                wm_latent = wm_action = None
+                wm_is_first = torch.ones_like(wm_is_first)
+                wm_action_history = torch.zeros_like(wm_action_history); wm_reward = torch.zeros_like(wm_reward)
+                wm_feature = torch.zeros((self.env.num_envs, self.wm_feature_dim), device=self.device)
+                wm_obs = {"prop": obs[:, self.env.privileged_dim:self.env.privileged_dim+self.env.cfg.env.prop_dim],
+                          "is_first":wm_is_first, "image":torch.zeros((self.env.num_envs,64,64,1),device=self.device)}
+                self.wm_buffer_index.fill(0)
+                cur_reward_sum.zero_(); cur_episode_length.zero_()
+
 
             # copy the config file
             if(it == 0):
@@ -385,6 +402,11 @@ class WMPRunner:
         self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
 
     def init_wm_dataset(self):
+        def image_storage(name):
+            # File-backed float32 replay keeps all 1024 true-depth histories while allowing OS page eviction.
+            shape=(self.env.cfg.depth.camera_num_envs, int(self.env.max_episode_length/self.wm_update_interval)+3, *self.env.cfg.depth.resized, 1)
+            path=pathlib.Path(self.log_dir)/'replay';path.mkdir(exist_ok=True)
+            return torch.from_numpy(np.memmap(path/(name+'.f32'),mode='w+',dtype=np.float32,shape=shape))
         self.wm_dataset = {
             "prop": torch.zeros((self.env.num_envs, int(self.env.max_episode_length / self.wm_update_interval) + 3, self.env.cfg.env.prop_dim),
                                 device='cpu'),
@@ -394,8 +416,7 @@ class WMPRunner:
                                   device='cpu'),
         }
         if(self.env.cfg.depth.use_camera):
-            self.wm_dataset["image"] = torch.zeros(((self.env.cfg.depth.camera_num_envs, int(self.env.max_episode_length / self.wm_update_interval) + 3,)
-                                               + self.env.cfg.depth.resized + (1,)), device='cpu')
+            self.wm_dataset["image"] = image_storage('dataset')
             self.wm_dataset["forward_height_map"] = torch.zeros(
                 (self.env.num_envs, int(self.env.max_episode_length / self.wm_update_interval) + 3,
                  self.env.cfg.env.forward_height_dim), device='cpu')
@@ -411,8 +432,7 @@ class WMPRunner:
                                   device='cpu'),
         }
         if(self.env.cfg.depth.use_camera):
-            self.wm_buffer["image"] = torch.zeros(((self.env.cfg.depth.camera_num_envs, int(self.env.max_episode_length / self.wm_update_interval) + 3,)
-                                               + self.env.cfg.depth.resized + (1,)), device='cpu')
+            self.wm_buffer["image"] = image_storage('buffer')
             self.wm_buffer["forward_height_map"] = torch.zeros(
                 (self.env.num_envs, int(self.env.max_episode_length / self.wm_update_interval) + 3,
                  self.env.cfg.env.forward_height_dim), device='cpu')
@@ -480,6 +500,7 @@ class WMPRunner:
             is_first[:, 0] = 1
             batch_data["is_first"] = is_first
             post, context, mets = self._world_model._train(batch_data)
+            self.wm_updates_done += 1
         wm_metrics.update(mets)
         return wm_metrics
 
@@ -490,9 +511,10 @@ class WMPRunner:
 
         ep_string = f''
         if locs['ep_infos']:
-            for key in locs['ep_infos'][0]:
+            for key in sorted(set().union(*(info.keys() for info in locs['ep_infos']))):
                 infotensor = torch.tensor([], device=self.device)
                 for ep_info in locs['ep_infos']:
+                    if key not in ep_info:continue
                     # handle scalar and zero dimensional tensor infos
                     if not isinstance(ep_info[key], torch.Tensor):
                         ep_info[key] = torch.Tensor([ep_info[key]])

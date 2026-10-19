@@ -2,10 +2,11 @@
 from types import SimpleNamespace
 import math, numpy as np, torch
 from .logic import Logic
+from .competition_tasks import CompetitionMixin
 from .config import asset_contract
 from .math import *
 
-class Core(Logic):
+class Core(CompetitionMixin, Logic):
     def __init__(self,backend):
         self.backend=backend; self.cfg=backend.cfg.legacy; self.device=backend.device
         self.sim_params=SimpleNamespace(dt=backend.physics_dt)
@@ -43,21 +44,34 @@ class Core(Logic):
         self.randomized_com_pos=torch.cat([torch_rand_float(*getattr(self.cfg.domain_rand,'com_'+a+'_pos_range'),(self.num_envs,1),self.device) for a in 'xyz'],1)
         self.global_counter=0; self.total_env_steps_counter=0
         self.reward_curriculum_coef=[s[2] for s in self.cfg.rewards.reward_curriculum_schedule]
+        self.init_competition()
         self.init_done=True
     def body_indices(self,patterns):
         return torch.tensor([i for p in patterns for i,n in enumerate(self.backend.robot.body_names) if p in n],device=self.device,dtype=torch.long)
     def _reset_dofs(self,ids):
         q=self.default_dof_pos*torch_rand_float(.5,1.5,(len(ids),12),self.device)
+        if getattr(self,'course',None) is not None:
+            mask=self.course.mask[ids]
+            q[mask]=self.default_dof_pos*torch_rand_float(.95,1.05,(int(mask.sum()),12),self.device)
         self.dof_pos[ids]=q; self.dof_vel[ids]=0
         self.backend.robot.write_joint_state_to_sim(q,torch.zeros_like(q),joint_ids=self.backend.joint_ids,env_ids=ids)
     def _reset_root_states(self,ids):
         self.root_states[ids]=self.base_init_state; self.root_states[ids,:3]+=self.env_origins[ids]
-        if self.custom_origins:self.root_states[ids,0]+=torch_rand_float(-1.,1.,(len(ids),),self.device)
+        if self.custom_origins:
+            jitter=torch_rand_float(-1.,1.,(len(ids),),self.device)
+            if getattr(self,'course',None) is not None:
+                jitter=torch.where(self.course.mask[ids],jitter*.025,jitter)
+            self.root_states[ids,0]+=jitter
         self.root_states[ids,7:13]=torch_rand_float(-.5,.5,(len(ids),6),self.device)
+        if getattr(self,'course',None) is not None:
+            new_ids=ids[self.course.mask[ids]]
+            self.root_states[new_ids,7:13]=0.
         self.backend.write_root(self.root_states[ids],ids)
     def _push_robots(self):
-        self.root_states[:,7:9]=torch_rand_float(-self.cfg.domain_rand.max_push_vel_xy,self.cfg.domain_rand.max_push_vel_xy,(self.num_envs,2),self.device)
-        self.backend.robot.write_root_velocity_to_sim(self.root_states[:,7:13])
+        ids=torch.arange(self.num_envs,device=self.device)
+        if getattr(self,'course',None) is not None:ids=ids[~self.course.mask]
+        self.root_states[ids,7:9]=torch_rand_float(-self.cfg.domain_rand.max_push_vel_xy,self.cfg.domain_rand.max_push_vel_xy,(len(ids),2),self.device)
+        self.backend.robot.write_root_velocity_to_sim(self.root_states[ids,7:13],ids)
     def _reward_feet_edge(self):
         if self.terrain is None:return torch.zeros(self.num_envs,device=self.device)
         return super()._reward_feet_edge()

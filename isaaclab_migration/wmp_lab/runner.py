@@ -22,7 +22,8 @@ class Runner(WMPRunner):
     def train_world_model(self):
         # Original sampler reads CPU replay and transfers only sampled trajectories.
         result=super().train_world_model()
-        if result:self.wm_updates_done+=self.wm_config.train_steps_per_iter
+        if result:
+            if not all(np.isfinite(np.asarray(v)).all() for v in result.values()):raise RuntimeError('Nonfinite world model training metrics')
         return result
     def train_depth_predictor(self):
         eligible=self.env.depth_index_without_crawl_tilt
@@ -52,7 +53,9 @@ class Runner(WMPRunner):
             discriminator=self.alg.discriminator.state_dict(),amp_optimizer=self.alg.optimizer.state_dict(),
             signatures=self.signatures(),amp_normalizer=self.alg.amp_normalizer,iter=self.current_learning_iteration,infos=infos,
             train_cfg={'runner':self.cfg,'algorithm':self.alg_cfg,'policy':self.policy_cfg,'depth_predictor':self.depth_predictor_cfg},
-            wm_config=vars(self.wm_config),wm_updates_done=self.wm_updates_done,depth_updates_done=self.depth_updates_done),path)
+            wm_config=vars(self.wm_config),wm_updates_done=self.wm_updates_done,depth_updates_done=self.depth_updates_done,
+            training_origin=getattr(self,'training_origin',self.current_learning_iteration),
+            competition_state=self.env.course.state_dict() if getattr(self.env,'course',None) is not None else None),path)
     def load(self,path,load_optimizer=True,**kwargs):
         d=torch.load(path,map_location=self.device,weights_only=False)
         self.alg.actor_critic.load_state_dict(d['model_state_dict']); self._world_model.load_state_dict(d['world_model_dict'])
@@ -61,6 +64,8 @@ class Runner(WMPRunner):
                 if not torch.equal(value,d[key][name]):raise RuntimeError(f'Checkpoint tensor mismatch: {key}/{name}')
         self.depth_predictor.load_state_dict(d['depth_predictor']); self.alg.discriminator.load_state_dict(d['discriminator'])
         self.alg.amp_normalizer=d['amp_normalizer']
+        if load_optimizer and d.get('competition_state') is not None and getattr(self.env,'course',None) is not None:
+            self.env.course.load_state_dict(d['competition_state'])
         if load_optimizer:
             self.alg.optimizer.load_state_dict(d['optimizer_state_dict']); self._world_model._model_opt._opt.load_state_dict(d['wm_optimizer_state_dict']); self.depth_predictor_opt.load_state_dict(d['depth_optimizer'])
         self.round_trip_verified=False
@@ -71,4 +76,5 @@ class Runner(WMPRunner):
                 torch.testing.assert_close(value,d['signatures'][key].cpu(),rtol=1e-5,atol=1e-5)
             self.round_trip_verified=True
             print('CHECKPOINT_OUTPUT_ROUND_TRIP_PASSED',flush=True)
+        if 'training_origin' in d:self.training_origin=d['training_origin']
         self.current_learning_iteration=d['iter']; self.wm_updates_done=d['wm_updates_done']; self.depth_updates_done=d['depth_updates_done']

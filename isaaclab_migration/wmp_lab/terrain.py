@@ -65,6 +65,9 @@ class Terrain:
 
         self.height_field_raw = np.zeros((self.tot_rows, self.tot_cols), dtype=np.int16)
         self.added_trimesh = None
+        self.competition_cells = {}
+        from .competition import column_types
+        self.column_types = column_types(cfg)
         if cfg.curriculum:
             self.curriculum()
         elif cfg.selected:
@@ -74,7 +77,14 @@ class Terrain:
 
         self.heightsamples = self.height_field_raw
         if self.type == "trimesh":
-            self.vertices, self.triangles, self.x_edge_mask = convert_heightfield_to_trimesh(self.height_field_raw,
+            if np.count_nonzero(self.height_field_raw)==0:
+                # A flat floor is exactly represented by two triangles. Avoid millions of coplanar faces.
+                x=(self.tot_rows-1)*cfg.horizontal_scale;y=(self.tot_cols-1)*cfg.horizontal_scale
+                self.vertices=np.array([[0,0,0],[x,0,0],[0,y,0],[x,y,0]],dtype=np.float32)
+                self.triangles=np.array([[0,1,2],[1,3,2]],dtype=np.uint32)
+                self.x_edge_mask=np.zeros_like(self.height_field_raw,dtype=bool)
+            else:
+                self.vertices, self.triangles, self.x_edge_mask = convert_heightfield_to_trimesh(self.height_field_raw,
                                                                                              self.cfg.horizontal_scale,
                                                                                              self.cfg.vertical_scale,
                                                                                              self.cfg.slope_treshold)
@@ -138,6 +148,18 @@ class Terrain:
                                            length=self.width_per_env_pixels,
                                            vertical_scale=self.cfg.vertical_scale,
                                            horizontal_scale=self.cfg.horizontal_scale)
+        from .competition import COMPETITION_TYPES, make_course, course_mesh, tile_center
+        kind = self.column_types[j]
+        if kind in COMPETITION_TYPES:
+            # Highest row is explicitly the standard course, independent of legacy i/rows.
+            if self.cfg.num_rows != 10:
+                raise ValueError('Competition terrain requires 10 rows (levels 0-9)')
+            course = make_course(kind, i)
+            self.competition_cells[i, j] = course
+            v, f = course_mesh(course)
+            v[:, :2] += np.asarray(tile_center(i, j, self.env_length, self.env_width)) + self.cfg.border_size
+            self.added_trimesh = (v, f) if self.added_trimesh is None else trimesh.combine_trimeshes(self.added_trimesh, (v, f))
+            return terrain
         amplitude = 0.1 + 0.2 * difficulty
         slope = difficulty * 0.4
         step_height = 0.05 + 0.18 * difficulty
@@ -335,6 +357,10 @@ class Terrain:
         y2 = int((self.env_width / 2. + 1) / terrain.horizontal_scale)
         env_origin_z = np.max(terrain.height_field_raw[x1:x2, y1:y2]) * terrain.vertical_scale
         self.env_origins[i, j] = [env_origin_x, env_origin_y, env_origin_z]
+        if (i, j) in self.competition_cells:
+            spawn = self.competition_cells[i, j].spawn
+            self.env_origins[i, j] = [env_origin_x + spawn[0], env_origin_y + spawn[1], spawn[2]]
+
 
 
 def gap_terrain(terrain, gap_size, platform_size=1.):
