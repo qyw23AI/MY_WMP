@@ -30,6 +30,21 @@ class CourseState:
         self.jump_airborne = torch.zeros(n, dtype=torch.bool, device=dev)
         self.jump_ready = torch.zeros(n, dtype=torch.bool, device=dev)
         self.landing_feet = torch.zeros(n, 4, dtype=torch.bool, device=dev)
+        self.strict_invalid = torch.zeros(n, dtype=torch.bool, device=dev)
+        self.strict_landed = torch.zeros(n, dtype=torch.bool, device=dev)
+        self.combo_crossing = torch.zeros(n, dtype=torch.bool, device=dev)
+        # Core's feet_indices follow articulation body order, not necessarily FL/FR/RL/RR.
+        names = getattr(c, 'foot_names', None)
+        if names is None:
+            names = [c.backend.robot.body_names[int(i)] for i in c.feet_indices.tolist()]
+        if len(names) != 4:
+            raise ValueError(f'Expected four named feet, got {names}')
+        front = [('FL' in name.upper() or 'FR' in name.upper()) for name in names]
+        rear = [('RL' in name.upper() or 'RR' in name.upper()) for name in names]
+        if sum(front) != 2 or sum(rear) != 2 or any(f and r for f, r in zip(front, rear)):
+            raise ValueError(f'Cannot identify two front and two rear feet: {names}')
+        self.combo_front_mask = torch.tensor(front, device=dev, dtype=torch.bool)
+        self.combo_rear_mask = torch.tensor(rear, device=dev, dtype=torch.bool)
         self.entered = torch.zeros(n, dtype=torch.bool, device=dev)
         self.visited = torch.zeros_like(self.entered)
         self.failed = torch.zeros_like(self.entered)
@@ -95,6 +110,7 @@ class CourseState:
         self.platforms[ids] = False
         self.jump_stage[ids] = 0; self.jump_airborne[ids] = False; self.jump_ready[ids] = False
         self.landing_feet[ids] = False
+        self.strict_invalid[ids] = False; self.strict_landed[ids] = False; self.combo_crossing[ids] = False
         self.violated[ids] = False
         self.failed[ids] = False; self.success[ids] = False; self.strict[ids] = False
         self.hold[ids] = 0.; self.reward[ids] = 0.
@@ -349,7 +365,7 @@ class CourseState:
         c.time_out_buf[ids] &= ~(self.failed[ids] | self.success[ids])
 
     def _update_combos(self, ids):
-        """Straight stairs -> one jump -> optional downhill, with pits on both sides."""
+        """Stairs -> gap -> optional downhill; ordinary completion and strict approval differ."""
         if not len(ids):return
         c = self.c
         rows, cols = c.terrain_levels[ids], c.terrain_types[ids]
@@ -367,67 +383,102 @@ class CourseState:
         support = top & contact[:, :, None]
         touched = support.any(1)
         old_coverage = self.coverage[ids].clone()
+
+        # These contact records qualify STRICT success, but never gate ordinary passage.
         self.coverage[ids, 0] |= touched[:, 1]
         self.coverage[ids, 1] |= touched[:, 2] & self.coverage[ids, 0]
         stairs_done = self.coverage[ids, :2].all(-1)
         self.coverage[ids, 2] |= touched[:, 3] & stairs_done
-        ready = stairs_done & inside[:, :, 3].all(-1) & (support[:, :, 3].sum(-1) >= 2)
-        self.jump_ready[ids] |= ready
+        # One legal launch-platform contact is enough; no airborne jump is required.
+        self.jump_ready[ids] |= touched[:, 3]
         self.entered[ids] |= self.coverage[ids, 2]
         self.platforms[ids, 0] |= self.coverage[ids, 2]
+
         already_landed = self.coverage[ids, 3].clone()
-        flight = ~contact.any(-1) & self.jump_ready[ids] & ~already_landed
-        flight &= root[:, 2] > boxes[:, 3, 4] + .10
-        self.jump_airborne[ids] |= flight
         target_feet = support[:, :, 4]
-        self.landing_feet[ids] |= target_feet & self.jump_airborne[ids, None]
+        # Crossing begins when a front foot moves beyond the launch platform's
+        # far edge. No all-feet-airborne or base-height requirement applies.
+        launch_edge = boxes[:, 3, 0] + boxes[:, 3, 2] / 2
+        target_edge = boxes[:, 4, 0] - boxes[:, 4, 2] / 2
+        crossed_front = (feet[:, self.combo_front_mask, 0] > (launch_edge + .005)[:, None]).any(-1)
+        self.combo_crossing[ids] |= self.jump_ready[ids] & crossed_front & ~self.strict_landed[ids]
+        crossing = self.combo_crossing[ids] & ~self.strict_landed[ids]
+        # Valid route-top contacts (stairs/launch) are not off-target contacts.
+        # On the rear feet, also permit the true gap and target's gap-facing half,
+        # including a non-top contact at that near edge; these are never valid
+        # target *supports* until top geometry and force checks both succeed.
+        rear_gap_or_near_target = ((feet[:, :, 0] > launch_edge[:, None])
+                                   & (feet[:, :, 0] <= boxes[:, 4, 0, None])
+                                   & (feet[:, :, 1].abs() <= boxes[:, 4, 3, None] / 2 + .005))
+        non_target = contact & ~target_feet & ~support[:, :, :4].any(-1)
+        forbidden = non_target & (self.combo_front_mask[None, :]
+                                  | (self.combo_rear_mask[None, :] & ~rear_gap_or_near_target))
+        self.strict_invalid[ids] |= crossing & forbidden.any(-1)
+        # Accumulate genuine target-top contacts separately for each of four feet.
+        self.landing_feet[ids] |= target_feet & crossing[:, None]
+        # Ordinary completion allows stepping over a small gap, asynchronous touchdown,
+        # and missing the strict stair-touch bookkeeping. It still requires reaching
+        # the real target platform with all feet inside and at least two supporting.
         cleared = (feet[:, :, 0] > (boxes[:, 3, 0] + .41)[:, None]).all(-1)
-        landed = self.jump_airborne[ids] & self.landing_feet[ids].all(-1) & inside[:, :, 4].all(-1)
-        landed &= cleared & (target_feet.sum(-1) >= 2)
-        wrong_landing = self.jump_airborne[ids] & (contact & ~target_feet).any(-1)
-        walked = target_feet.any(-1) & ~self.jump_airborne[ids] & ~already_landed
-        skipped_stairs = (root[:, 0] > boxes[:, 3, 0] - .2) & ~stairs_done
+        landed = cleared & inside[:, :, 4].all(-1) & (target_feet.sum(-1) >= 2)
+
         surface = self.query(feet[:, :, :2], rows, cols)
         on_slope = (feet[:, :, 0] > ramps[:, None, 0] + .03) & (feet[:, :, 0] < ramps[:, None, 1] - .03)
         on_slope &= feet[:, :, 1].abs() < .395
         slope_support = on_slope & ((sole - surface).abs() < .02) & contact & downhill[:, None]
-        # Off-track feet below road height, and gap feet below the raised tops, fail immediately.
+
+        # Only physical hazards / track departures cause task-specific resets.
         over_gap = (feet[:, :, 0] > (boxes[:, 3, 0] + .4)[:, None]) & (feet[:, :, 0] < (boxes[:, 4, 0] - .4)[:, None])
-        gap_drop = (over_gap & (sole < boxes[:, None, 3, 4] - .02)).any(-1)
+        # Shallow rear-leg probing in the gap is permitted; a genuinely deep rear
+        # drop remains a hazard. Front-leg gap drops retain the original limit.
+        gap_depth = torch.where(self.combo_front_mask[None, :], .02, .20)
+        gap_drop = (over_gap & (sole < boxes[:, None, 3, 4] - gap_depth)).any(-1)
         centerline = torch.stack((feet[:, :, 0], torch.zeros_like(sole)), -1)
         lane_surface = self.query(centerline, rows, cols).clamp(min=0.)
         side_drop = ((feet[:, :, 1].abs() > .4) & (sole < lane_surface - .02)).any(-1)
-        bad_contact = (contact & ~(top.any(-1) | slope_support)).any(-1)
         side = root[:, 1].abs() > .4
         dropped = root[:, 2] < -.15
-        # Do not continue beyond a no-ramp finish platform into the pit.
         off_end = ~downhill & (root[:, 0] > boxes[:, 4, 0] + .4)
-        bad = wrong_landing | walked | skipped_stairs | gap_drop | side_drop | bad_contact | side | dropped | off_end
+        bad = gap_drop | side_drop | side | dropped | off_end
         self.violated[ids] |= bad
         self.failed[ids] |= bad | (c.reset_buf[ids] & ~c.time_out_buf[ids])
+
         landed &= ~self.failed[ids]
+        new_landed = landed & ~already_landed
         self.coverage[ids, 3] |= landed
         self.platforms[ids, 1] |= landed
         self.jump_stage[ids] = self.coverage[ids, 3].long()
-        self.jump_airborne[ids] &= ~landed
+
+        # Strict landing requires four separately recorded target-top contacts,
+        # all feet positioned inside the target, and >=2 feet currently supporting.
+        # Do not require simultaneous four-foot support or a genuine airborne phase.
+        steady = (c.projected_gravity[ids, 2] < -.8) & (c.root_states[ids, 9].abs() < .8)
+        clean_landing = (crossing & self.coverage[ids, 2] & self.landing_feet[ids].all(-1)
+                         & inside[:, :, 4].all(-1) & (target_feet.sum(-1) >= 2)
+                         & stairs_done & steady & ~self.strict_invalid[ids] & ~self.failed[ids])
+        self.strict_landed[ids] |= clean_landing
+        # No strict off-target-contact checks after target landing; the downhill
+        # section of stair_gap_ramp is a legal next stage.
         self.coverage[ids, 4] |= slope_support.any(-1) & self.coverage[ids, 3]
-        self.coverage[ids, 4] |= ~downhill  # no slope is required in combination A
+        self.coverage[ids, 4] |= ~downhill  # no slope is required for combination A
         final_platform = inside[:, :, 4].all(-1) & (target_feet.sum(-1) >= 2)
         ground_exit = inside[:, :, 5].all(-1) & (support[:, :, 5].sum(-1) >= 2)
         ground_exit &= (feet[:, :, 0] > ramps[:, None, 1] + .05).all(-1) & (root[:, 0] > ramps[:, 1] + .35)
         at_finish = torch.where(downhill, ground_exit & self.coverage[ids, 4], final_platform)
-        at_finish &= self.coverage[ids, :4].all(-1)
-        # Stop advancing once the complete route has reached its finish support.
+        at_finish &= self.coverage[ids, 3]
         c.commands[ids[at_finish], :3] = 0.
-        stable = at_finish & (c.projected_gravity[ids, 2] < -.8) & (c.root_states[ids, 9].abs() < .35)
+        stable = at_finish & steady
         self.coverage[ids, 5] |= stable
         self.hold[ids] = torch.where(stable & ~self.failed[ids], self.hold[ids] + c.dt, 0.)
         success = (self.hold[ids] >= .30) & ~self.failed[ids]
-        new_success = success & ~self.success[ids]
-        self.success[ids] |= success;self.strict[ids] |= success
+        strict_success = success & self.strict_landed[ids] & stairs_done & ~self.strict_invalid[ids]
+        new_strict = strict_success & ~self.strict[ids]
+        self.success[ids] |= success  # curriculum promotion and normal episode end
+        self.strict[ids] |= strict_success  # full-course success reward / evaluation only
         new = self.coverage[ids] & ~old_coverage
-        self.reward[ids] = .5*new[:, :3].sum(-1) + 2*landed.float()
-        self.reward[ids] += downhill * new[:, 4].float() + 4*new_success.float() - 5*bad.float()
+        # No launch-platform bonus or task-specific failure penalty.
+        self.reward[ids] = .5*new[:, :2].sum(-1) + .5*new_landed.float()
+        self.reward[ids] += .5*downhill*new[:, 4].float() + 2*new_strict.float()
         c.reset_buf[ids] |= self.failed[ids] | self.success[ids]
         c.time_out_buf[ids] &= ~(self.failed[ids] | self.success[ids])
 
@@ -471,6 +522,7 @@ class CourseState:
             if name in COMBO_TYPES:
                 self.last_metrics[f'{name}/stairs_completed'] = self.coverage[selected, :2].all(-1).float().mean()
                 self.last_metrics[f'{name}/jump_completed'] = self.coverage[selected, 3].float().mean()
+                self.last_metrics[f'{name}/strict_landing_violation'] = self.strict_invalid[selected].float().mean()
                 if name == 'stair_gap_ramp':
                     self.last_metrics[f'{name}/downhill_contact'] = self.coverage[selected, 4].float().mean()
             self.last_metrics[f'{name}/failure'] = self.failed[selected].float().mean()
@@ -580,6 +632,17 @@ class CompetitionMixin:
     def check_termination(self):
         super().check_termination()
         if getattr(self, 'course', None) is None:return
+        combo_ids = self.course.ids[
+            (self.course.kind[self.course.ids] == COMPETITION_TYPES.index('stair_gap')) |
+            (self.course.kind[self.course.ids] == COMPETITION_TYPES.index('stair_gap_ramp'))]
+        if len(combo_ids):
+            # All terrain types use the same configured episode timeout.
+            # Reconstruct reset from the original physical causes for combos.
+            base_collision = torch.any(torch.norm(
+                self.contact_forces[combo_ids][:, self.termination_contact_indices, :], dim=-1
+            ) > 1., dim=1)
+            self.reset_buf[combo_ids] = (base_collision | self.vel_violate[combo_ids] |
+                                         self.fall[combo_ids] | self.time_out_buf[combo_ids])
         # Wall contact may be part of climbing. Retain falls/timeouts and detect a grounded base,
         # rather than treating every brief base/wall contact as an immediate fall.
         ids = self.course.ids[self.course.kind[self.course.ids] == 2]

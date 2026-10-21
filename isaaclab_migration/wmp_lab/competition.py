@@ -55,6 +55,7 @@ def maximum_level(kind):
 
 def course_revision(kind):
     if kind in PLUM_TYPES:return 5
+    if kind in COMBO_TYPES:return 4  # updated rewards and independent 30s combo timeout
     return 2 if kind in (*PLUM_TYPES, 'high_wall', 'tire_array') else 1
 
 @dataclass

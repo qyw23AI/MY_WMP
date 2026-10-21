@@ -10,14 +10,14 @@ from wmp_lab.competition_tasks import CourseState
 from wmp_lab.a1_config import A1AMPCfg
 
 
-def fake_core(kind='plum_stones', level=None, count=1, device='cpu'):
+def fake_core(kind='plum_stones', level=None, count=1, device='cpu', foot_names=('FL_foot','FR_foot','RL_foot','RR_foot')):
     if level is None:level=maximum_level(kind)
     cfg=A1AMPCfg();configure_competition(cfg,kind)
     courses={(r,c):make_course(kind,r) for r in range(cfg.terrain.num_rows) for c in range(cfg.terrain.num_cols)}
     origins=torch.tensor([[[(r+.5)*8+courses[r,c].spawn[0],(c+.5)*8,courses[r,c].spawn[2]] for c in range(cfg.terrain.num_cols)] for r in range(cfg.terrain.num_rows)])
     c=NS(cfg=cfg,num_envs=count,device='cpu',terrain_types=torch.zeros(count,dtype=torch.long),terrain_levels=torch.full((count,),level,dtype=torch.long),terrain_origins=origins,
          terrain=NS(column_types=[kind]*cfg.terrain.num_cols,competition_cells=courses,env_length=8.,env_width=8.),
-         root_states=torch.zeros(count,13),rigid_body_pos=torch.zeros(count,4,3),feet_indices=torch.arange(4),
+         root_states=torch.zeros(count,13),rigid_body_pos=torch.zeros(count,4,3),feet_indices=torch.arange(4),foot_names=foot_names,
          base_lin_vel=torch.zeros(count,3),commands=torch.zeros(count,4),
          base_quat=torch.tensor([[0.,0.,0.,1.]]).repeat(count,1),
          forward_vec=torch.tensor([[1.,0.,0.]]).repeat(count,1),
@@ -473,7 +473,7 @@ class CompetitionTests(unittest.TestCase):
             self.assertFalse(s.failed.any())
         x = (spec.boxes[3][0]+spec.boxes[4][0])/2;h = spec.height
         place(c, s, [x, 0., h+.5], [[x, 0., h+.2]]*4, contacts=(0,0,0,0));s.update()
-        self.assertTrue(s.jump_airborne.all());self.assertFalse(s.failed.any())
+        self.assertTrue(s.combo_crossing.all());self.assertFalse(s.failed.any())
         return c, s, spec
 
     def test_gap_training_weights_and_combo_reward(self):
@@ -492,12 +492,12 @@ class CompetitionTests(unittest.TestCase):
             x=spec.boxes[4][0];h=spec.height
             c.commands[:,0]=.25
             place(c,s,[x,0.,h+.35],[[x,0.,h+.02]]*4);s.update()
-            self.assertEqual(float(s.reward[0]),2.)
+            self.assertEqual(float(s.reward[0]),.5)
             if kind=='stair_gap':
                 self.assertEqual(float(c.commands[0,0]),0.)
                 for _ in range(15):s.update()
-                self.assertTrue(s.success.all())
-                self.assertEqual(float(s.reward[0]),4.)
+                self.assertTrue(s.success.all());self.assertTrue(s.strict.all())
+                self.assertEqual(float(s.reward[0]),2.)
 
     def test_combo_asynchronous_landing_and_separate_finishes(self):
         for kind in COMBO_TYPES:
@@ -506,7 +506,8 @@ class CompetitionTests(unittest.TestCase):
                 x = spec.boxes[4][0];h = spec.height
                 feet = [[x,0.,z] for z in (h+.02,h+.02,h+.2,h+.2)]
                 place(c,s,[x,0.,h+.35],feet,contacts=(1,1,0,0));s.update()
-                self.assertFalse(s.failed.any());self.assertFalse(s.coverage[0,3])
+                self.assertFalse(s.failed.any());self.assertTrue(s.coverage[0,3])
+                self.assertFalse(s.strict_landed[0])
                 feet = [[x,0.,z] for z in (h+.2,h+.2,h+.02,h+.02)]
                 place(c,s,[x,0.,h+.35],feet,contacts=(0,0,1,1));s.update()
                 self.assertTrue(s.coverage[0,3]);self.assertFalse(s.failed.any())
@@ -518,34 +519,99 @@ class CompetitionTests(unittest.TestCase):
                     start,end,_,_,_=spec.ramps[0];x=(start+end)/2
                     place(c,s,[x,0.,h/2+.35],[[x,0.,h/2+.02]]*4);s.update()
                     self.assertTrue(s.coverage[0,4]);self.assertFalse(s.failed.any())
+                    self.assertEqual(float(s.reward[0]),.5)
                     x=spec.boxes[5][0]
                     place(c,s,[x,0.,.35],[[x,0.,.02]]*4)
                     for _ in range(16):s.update()
                     self.assertTrue(s.success.all());self.assertTrue(s.strict.all())
 
-    def test_combo_partial_landing_gap_foot_and_side_foot_fail(self):
+    def test_combo_hazards_remain_fatal_but_off_target_contact_is_not(self):
         for kind in COMBO_TYPES:
-            for mode in ('gap','side','outside_contact'):
+            for mode in ('front_gap_drop','rear_deep_gap_drop','side','rear_outside'):
                 c,s,spec=self.combo_before_landing(kind)
                 x=spec.boxes[4][0];h=spec.height
-                feet=[[x,0.,h+.02]]*3+[[x,0.,h+.2]]
-                if mode=='gap':feet[3]=[(spec.boxes[3][0]+x)/2,0.,h-.03]
+                feet=[[x,0.,h+.02]]*4
+                contacts=(1,1,1,1)
+                if mode=='front_gap_drop':
+                    feet[0]=[(spec.boxes[3][0]+x)/2,0.,h-.03]
+                elif mode=='rear_deep_gap_drop':
+                    feet[3]=[(spec.boxes[3][0]+x)/2,0.,h-.25]
                 elif mode=='side':feet[3]=[x,.5,h-.03]
                 else:feet[3]=[x,.5,h+.02]
-                place(c,s,[x,0.,h+.35],feet,contacts=(1,1,1,int(mode=='outside_contact')));s.update()
-                self.assertTrue(s.failed.all());self.assertTrue(c.reset_buf.all())
-                self.assertFalse(s.coverage[0,3]);self.assertFalse(s.success.any())
+                place(c,s,[x,0.,h+.35],feet,contacts);s.update()
+                self.assertEqual(bool(s.failed[0]),mode!='rear_outside')
+                if mode=='rear_outside':
+                    self.assertTrue(s.strict_invalid[0])
+                    self.assertFalse(c.reset_buf[0])
+                else:
+                    self.assertTrue(c.reset_buf[0])
+                    self.assertEqual(float(s.reward[0]),0.)  # no task-specific failure penalty
+    def test_combo_stage_rewards_without_launch_bonus(self):
+        for kind in COMBO_TYPES:
+            c,s=fake_core(kind,0);spec=make_course(kind,0)
+            for index in (1,2,3):
+                x,_,_,_,h=spec.boxes[index]
+                place(c,s,[x,0.,h+.35],[[x,0.,h+.02]]*4);s.update()
+                self.assertAlmostEqual(float(s.reward[0]),.5 if index<3 else 0.)
+            self.assertTrue(s.jump_ready[0])
+            self.assertTrue(s.coverage[0,2])
 
-    def test_combo_cannot_skip_stairs_or_downhill(self):
-        c,s=fake_core('stair_gap');spec=make_course('stair_gap',9);x=spec.boxes[3][0];h=spec.height
+    def test_all_terrain_timeout_is_20_seconds(self):
+        # Exercise the real check_termination override without launching Isaac Lab.
+        from wmp_lab.competition_tasks import CompetitionMixin
+        from wmp_lab.logic import Logic
+        class TerminationProbe(CompetitionMixin, Logic):
+            pass
+        def make_probe(kind):
+            core,course=fake_core(kind,0)
+            probe=TerminationProbe();probe.__dict__.update(vars(core))
+            probe.course=course;course.c=probe
+            probe.max_episode_length=1000  # 20s at 50 Hz
+            probe.termination_contact_indices=torch.empty(0,dtype=torch.long)
+            approach=make_course(kind,0).boxes[0]
+            place(probe,course,[approach[0],0.,.35],[[approach[0],0.,.02]]*4,contacts=(0,0,0,0))
+            return probe,course
+        for kind in ('stair_gap','stair_gap_ramp','platform'):
+            core,course=make_probe(kind)
+            core.episode_length_buf.fill_(1000);core.check_termination()
+            self.assertFalse(core.time_out_buf.any(), kind)
+            self.assertFalse(core.reset_buf.any(), kind)
+            core.episode_length_buf.fill_(1001);core.check_termination()
+            self.assertTrue(core.time_out_buf.all(), kind)
+            self.assertTrue(core.reset_buf.all(), kind)
+            self.assertFalse(course.failed.any(), kind)  # timeout is not a task failure
+
+    def test_combo_skipped_stairs_normal_completion_only(self):
+        c,s=fake_core('stair_gap',9);spec=make_course('stair_gap',9)
+        x=spec.boxes[3][0];h=spec.height
         place(c,s,[x,0.,h+.35],[[x,0.,h+.02]]*4);s.update()
-        self.assertTrue(s.failed.all())
+        self.assertFalse(s.failed.any());self.assertFalse(s.coverage[0,:2].any())
+        x=spec.boxes[4][0]
+        place(c,s,[x,0.,h+.35],[[x,0.,h+.02]]*4)
+        for _ in range(16):s.update()
+        self.assertTrue(s.success.all());self.assertFalse(s.strict.any())
+        self.assertEqual(float(s.reward[0]),0.)
         c,s,spec=self.combo_before_landing('stair_gap_ramp')
         x=spec.boxes[4][0];h=spec.height
         place(c,s,[x,0.,h+.35],[[x,0.,h+.02]]*4);s.update()
         x=spec.boxes[5][0];place(c,s,[x,0.,.35],[[x,0.,.02]]*4)
         for _ in range(16):s.update()
         self.assertFalse(s.success.any());self.assertFalse(s.coverage[0,4])
+
+    def test_combo_ordinary_completion_after_off_target_touch_has_no_strict_reward(self):
+        c,s,spec=self.combo_before_landing('stair_gap',0)
+        launch=spec.boxes[3][0];target=spec.boxes[4][0];h=spec.height
+        # Launch platform is a legal route support, even after crossing starts.
+        place(c,s,[launch,0.,h+.35],[[launch,0.,h+.02]]*4);s.update()
+        self.assertFalse(s.strict_invalid[0]);self.assertFalse(s.failed[0])
+        feet=[[target,0.,h+.02]]*4
+        feet[0]=[target,.5,h+.02]  # front non-target contact, not a physical fall
+        place(c,s,[target,0.,h+.35],feet);s.update()
+        self.assertTrue(s.strict_invalid[0]);self.assertFalse(s.failed[0])
+        place(c,s,[target,0.,h+.35],[[target,0.,h+.02]]*4)
+        for _ in range(16):s.update()
+        self.assertTrue(s.success[0]);self.assertFalse(s.strict[0])
+        self.assertEqual(float(s.reward[0]),0.)
 
     def test_platform_gap_allows_sequential_foot_contacts(self):
         c,s=fake_core('platform_gap');spec=make_course('platform_gap',9)
