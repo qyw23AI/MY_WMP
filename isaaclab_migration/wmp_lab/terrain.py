@@ -148,13 +148,21 @@ class Terrain:
                                            length=self.width_per_env_pixels,
                                            vertical_scale=self.cfg.vertical_scale,
                                            horizontal_scale=self.cfg.horizontal_scale)
-        from .competition import COMPETITION_TYPES, make_course, course_mesh, tile_center
+        from .competition import COMPETITION_TYPES, make_course, course_mesh, tile_center, level_count
         kind = self.column_types[j]
+        if getattr(self.cfg, 'competition', False):
+            # The shared grid has 15 rows when plum courses are present. Other
+            # lanes keep ten levels and never use or populate the extra cells.
+            if i >= level_count(kind):return terrain
+            if kind not in COMPETITION_TYPES:difficulty = i / level_count(kind)
         if kind in COMPETITION_TYPES:
-            # Highest row is explicitly the standard course, independent of legacy i/rows.
-            if self.cfg.num_rows != 10:
-                raise ValueError('Competition terrain requires 10 rows (levels 0-9)')
+            if self.cfg.num_rows < level_count(kind):
+                raise ValueError(f'{kind} requires {level_count(kind)} terrain rows')
             course = make_course(kind, i)
+            if course.floor_height < 0:
+                # Remove the normal zero-height tile under the exact platform meshes.
+                # Otherwise it would silently bridge every narrow jump gap.
+                terrain.height_field_raw.fill(round(course.floor_height / self.cfg.vertical_scale))
             self.competition_cells[i, j] = course
             v, f = course_mesh(course)
             v[:, :2] += np.asarray(tile_center(i, j, self.env_length, self.env_width)) + self.cfg.border_size

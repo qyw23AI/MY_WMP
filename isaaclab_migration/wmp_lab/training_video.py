@@ -5,7 +5,7 @@ import json,random,time
 from pathlib import Path
 import numpy as np
 import torch
-from .competition import COMPETITION_TYPES
+from .competition import COMPETITION_TYPES, standard_level, maximum_level
 
 
 def atomic_json(path,data):
@@ -22,7 +22,7 @@ class CourseVideo:
             videos=self.root/'videos';videos.mkdir(parents=True,exist_ok=True)
             self.index=json.loads((videos/'index.json').read_text()) if (videos/'index.json').exists() else []
             if not (videos/'index.md').exists():
-                (videos/'index.md').write_text('首组正式录像将在本次训练完成300轮后自动生成。每300轮：三类地形各含课程前沿与9级，共六段20秒MP4。\n')
+                (videos/'index.md').write_text('首组正式录像将在本次训练完成300轮后自动生成。每300轮：当前地形各含课程前沿与比赛基准等级，每段20秒MP4。\n')
                 atomic_json(videos/'index.json',self.index)
     def __call__(self,iteration):
         local=iteration-self.origin
@@ -31,12 +31,14 @@ class CourseVideo:
         summaries={}
         for k,name in enumerate(COMPETITION_TYPES):
             n=c.attempts[k].sum().item();den=max(n,1);counts=c.totals[k].sum(0).tolist()
-            top=int(c.attempts[k,9])
+            standard=standard_level(name);top=int(c.attempts[k,standard])
             summaries[name]=dict(attempts=n,strict_success_rate=float(c.strict_wins[k].sum())/den,
                 failure_rate=counts[0]/den,violation_rate=counts[1]/den,timeout_rate=counts[2]/den,
                 platform_contact_rates=[x/den for x in counts[3:5]],stone_contact_rates=[x/den for x in counts[5:11]],
                 all_six_rate=counts[11]/den,frontier=int(c.frontier[k]),standard_attempts=top,
-                standard_strict_success_rate=float(c.strict_wins[k,9])/top if top else None)
+                standard_level=standard,standard_strict_success_rate=float(c.strict_wins[k,standard])/top if top else None,
+                target_level=maximum_level(name),target_attempts=int(c.attempts[k,maximum_level(name)]),
+                target_strict_success_rate=float(c.strict_wins[k,maximum_level(name)])/int(c.attempts[k,maximum_level(name)]) if int(c.attempts[k,maximum_level(name)]) else None)
         atomic_json(self.root/'progress.json',dict(training_round=local,checkpoint_iteration=iteration,courses=summaries,
                     world_model_updates=self.r.wm_updates_done,depth_updates=self.r.depth_updates_done,
                     world_model_updates_since_start=self.r.wm_updates_done-self.initial_wm_updates,
@@ -70,7 +72,8 @@ class CourseVideo:
         try:
             core.cfg.terrain.competition_stage='eval';core.cfg.terrain.competition_speed=(.2,.2)
             for k,name in enumerate(COMPETITION_TYPES):
-                for label,level in [('frontier',int(saved['frontier'][k])),('standard',9)]:
+                if name not in core.terrain.column_types:continue
+                for label,level in [('frontier',int(saved['frontier'][k])),('standard',standard_level(name))]:
                     torch.manual_seed(2027);np.random.seed(2027);random.seed(2027)
                     core.terrain_types.copy_(types);c.kind.copy_(kind)
                     core.terrain_types[0]=next(i for i,n in enumerate(core.terrain.column_types) if n==name);c.kind[0]=k

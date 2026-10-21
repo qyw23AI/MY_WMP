@@ -12,9 +12,9 @@ parser.add_argument('--camera_envs',type=int,default=None,help='Depth cameras: c
 parser.add_argument('--iterations',type=int,default=1000)
 parser.add_argument('--save_interval',type=int,default=100)
 parser.add_argument('--rollout_steps',type=int,default=24)
-parser.add_argument('--terrain',choices=['plane','mixed','robocon','robocon_mixed','plum_stones','tire_array','high_wall'],default='mixed')
+parser.add_argument('--terrain',choices=['plane','mixed','robocon','robocon_mixed','gap_training','plum_stones','platform_plum_combo','plum_stones_flat','tire_array','high_wall','platform','ramp','platform_gap','gap_combos','stair_gap','stair_gap_ramp'],default='mixed')
 parser.add_argument('--competition_stage',choices=['learn','standard','eval'],default='learn')
-parser.add_argument('--episode_seconds',type=float,default=20.)
+parser.add_argument('--episode_seconds',type=float,default=None,help='Episode limit: 45s for competition courses, 20s for plane/mixed')
 parser.add_argument('--wm_batch',type=int,default=2)
 parser.add_argument('--wm_length',type=int,default=16)
 parser.add_argument('--wm_start',type=int,default=256)
@@ -26,7 +26,7 @@ parser.add_argument('--depth_iters',type=int,default=1)
 parser.add_argument('--checkpoint',type=Path)
 parser.add_argument('--runtime_config',action='store_true',help='Override checkpoint batch/replay/update settings with explicit CLI resource settings; keep networks and optimizer states')
 parser.add_argument('--reset_course_stats',action='store_true',help='Reset competition curriculum counters after loading a checkpoint under changed rules')
-parser.add_argument('--compact_courses',action='store_true',help='One geometric lane per competition type; retain all 10 levels')
+parser.add_argument('--compact_courses',action='store_true',help='One lane per competition type; plum retains 15 levels, others 10')
 parser.add_argument('--video_interval',type=int,default=0)
 parser.add_argument('--progress_interval',type=int,default=0,help='Write course progress and checkpoint at this interval without recording video')
 parser.add_argument('--video_steps',type=int,default=1000)
@@ -39,7 +39,7 @@ parser.add_argument('--capture_every_steps',type=int,default=20)
 parser.add_argument('--capture_fps',type=int,default=0,help='Capture at real simulation-time FPS (50 Hz control loop); overrides capture interval')
 parser.add_argument('--follow_camera',action='store_true')
 parser.add_argument('--eval_terrain_col',type=int,default=None,help='Playback: put viewed robot on this terrain column')
-parser.add_argument('--eval_terrain_level',type=int,default=6,help='Playback terrain difficulty row, 0-9')
+parser.add_argument('--eval_terrain_level',type=int,default=6,help='Playback difficulty: plum 0-14, other terrains 0-9')
 parser.add_argument('--fixed_forward_speed',type=float,default=None,help='Playback: hold a forward command in m/s')
 parser.add_argument('--play',action='store_true')
 parser.add_argument('--probe',action='store_true')
@@ -49,6 +49,9 @@ parser.add_argument('--require_wm_updates',action='store_true')
 parser.add_argument('--seconds',type=float,default=30.,help='Playback wall seconds; zero runs until window closes')
 parser.add_argument('--play_steps',type=int,default=0,help='Playback control steps; overrides wall seconds when positive')
 AppLauncher.add_app_launcher_args(parser); args=parser.parse_args(); args.enable_cameras=args.camera_backend=='rtx'
+if args.episode_seconds is None:
+    args.episode_seconds=20. if args.terrain in ('plane','mixed') else 45.
+if args.episode_seconds<=0:parser.error('--episode_seconds must be positive')
 if args.num_envs<4:parser.error('Use at least 4 environments for WMP terrain sampling')
 if args.camera_envs is None:
     args.camera_envs=max(1,args.num_envs//4) if args.terrain not in ('plane','mixed') else args.num_envs
@@ -56,7 +59,7 @@ if not 1<=args.camera_envs<=args.num_envs:parser.error('--camera_envs must be be
 if args.save_interval<1:parser.error('--save_interval must be positive')
 if args.capture_every_steps<1 or args.play_steps<0 or not 0<=args.capture_fps<=50:parser.error('Capture interval/play steps or capture FPS is invalid')
 if args.eval_terrain_col is not None and (not args.play or args.eval_terrain_col<0):parser.error('--eval_terrain_col requires --play and a nonnegative column (validated against the selected profile)')
-if args.eval_terrain_level not in range(10):parser.error('--eval_terrain_level must be 0-9')
+if args.eval_terrain_level not in range(15):parser.error('--eval_terrain_level must be 0-14 (other terrains: 0-9)')
 if args.fixed_forward_speed is not None and (not args.play or args.fixed_forward_speed<0):parser.error('--fixed_forward_speed requires --play and a nonnegative speed')
 if args.record_course_videos and (not args.play or not args.checkpoint or args.headless or args.terrain!='robocon' or args.record_round is None):
     parser.error('--record_course_videos requires GUI --play, --checkpoint, --terrain robocon and --record_round')
@@ -98,11 +101,17 @@ try:
         from wmp_lab.competition import configure_competition
         configure_competition(cfg,args.terrain,'eval' if args.play else args.competition_stage)
         if args.compact_courses:
-            if args.terrain!='robocon':raise ValueError('Compact courses require robocon')
-            cfg.terrain.num_cols=3;cfg.terrain.terrain_proportions=[0.]*10+[1/3]*3
+            if args.terrain not in ('robocon','gap_combos'):raise ValueError('Compact courses require robocon or gap_combos')
+            from wmp_lab.competition import COMPETITION_TYPES, COMBO_TYPES, ALL_TYPES
+            # The manual checkpoint recorder retains its original six clips.
+            kinds = COMBO_TYPES if args.terrain=='gap_combos' else (COMPETITION_TYPES[:3] if args.record_course_videos else COMPETITION_TYPES)
+            cfg.terrain.num_cols=len(kinds)
+            cfg.terrain.terrain_proportions=[1/len(kinds) if kind in kinds else 0. for kind in ALL_TYPES]
     if args.eval_terrain_col is not None and args.eval_terrain_col>=cfg.terrain.num_cols:
         raise ValueError(f'Column {args.eval_terrain_col} outside selected terrain profile ({cfg.terrain.num_cols} columns)')
     if args.eval_terrain_col is not None:
+        if args.eval_terrain_level >= cfg.terrain.num_rows:
+            raise ValueError('Requested evaluation level is outside this terrain profile')
         cfg.terrain.curriculum=False
         cfg.terrain.eval_terrain_col=args.eval_terrain_col
         cfg.terrain.eval_terrain_level=args.eval_terrain_level
