@@ -3,3 +3,5 @@ __pycache__/
 isaaclab_migration/.cache/
 isaaclab_migration/logs/
 isaaclab_migration/outputs/
+*tmp
+*output

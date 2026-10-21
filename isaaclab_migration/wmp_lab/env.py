@@ -11,6 +11,17 @@ from .config import asset_contract
 from .core import Core
 from .math import quat_rotate_inverse, torch_rand_float
 
+class CameraSubsetRayCaster(RayCasterCamera):
+    """Ray-cast only for robots whose depth images are used for training."""
+    def __init__(self,cfg,camera_env_ids,num_envs):
+        self.active_camera_mask=torch.zeros(num_envs,device=camera_env_ids.device,dtype=torch.bool)
+        self.active_camera_mask[camera_env_ids]=True
+        super().__init__(cfg)
+
+    def _update_buffers_impl(self,env_ids):
+        active_ids=env_ids[self.active_camera_mask[env_ids]]
+        if len(active_ids):super()._update_buffers_impl(active_ids)
+
 class WMPEnv(DirectRLEnv):
     def __init__(self,cfg,**kwargs):
         self.core=None; super().__init__(cfg,**kwargs)
@@ -27,11 +38,13 @@ class WMPEnv(DirectRLEnv):
         self.joint_ids,_=self.robot.find_joints(names,preserve_order=True)
         self.contact_ids=[self.contacts.body_names.index(n) for n in self.robot.body_names]
         from isaaclab.utils.math import quat_mul, quat_from_euler_xyz
-        pose_ids=self.camera_env_ids if self.cfg.camera_backend=='rtx' else torch.arange(self.num_envs,device=self.device)
+        pose_ids=self.camera_env_ids
         self.camera_pitch=torch_rand_float(-5.,5.,(len(pose_ids),),self.device)*math.pi/180
         zero=torch.zeros_like(self.camera_pitch)
         orientation=quat_mul(self.robot.data.root_quat_w[pose_ids],quat_from_euler_xyz(zero,self.camera_pitch,zero))
-        self.camera.set_world_poses(orientations=orientation,convention='world')
+        if self.cfg.camera_backend=='raycast':
+            self.camera.set_world_poses(orientations=orientation,env_ids=pose_ids,convention='world')
+        else:self.camera.set_world_poses(orientations=orientation,convention='world')
         self.core=Core(self); self.randomize_properties()
         initial=self.core.base_init_state.repeat(self.num_envs,1); initial[:,:3]+=self.core.env_origins
         self.write_root(initial,torch.arange(self.num_envs,device=self.device)); self.sync_state(self.core)
@@ -119,7 +132,8 @@ class WMPEnv(DirectRLEnv):
                 mesh_prim_paths=['/World/ground'],max_distance=100.,data_types=['distance_to_image_plane'],
                 offset=RayCasterCameraCfg.OffsetCfg(pos=(.27,0.,.03),rot=(.5,-.5,.5,-.5),convention='ros'),
                 pattern_cfg=patterns.PinholeCameraPatternCfg(focal_length=24.,horizontal_aperture=2*24*math.tan(math.radians(58)/2),height=64,width=64))
-            self.camera=RayCasterCamera(cam_cfg)
+            self.camera=CameraSubsetRayCaster(cam_cfg,self.camera_env_ids,self.num_envs)
+            print('RAYCAST_ACTIVE_CAMERAS',count,'/',self.num_envs,flush=True)
         self.scene.sensors['depth_camera']=self.camera
         if self.cfg.camera_backend=='rtx':
             camera_paths=sim_utils.find_matching_prim_paths('/World/envs/env_.*/Robot/base/depth_camera')
@@ -167,7 +181,9 @@ class WMPEnv(DirectRLEnv):
         if self.core is None:return
         self.core.reset_idx(ids); self.robot.reset(ids); self.contacts.reset(ids)
         camera_ids=self.camera_lookup[ids]; camera_ids=camera_ids[camera_ids>=0]
-        if self.cfg.camera_backend=='raycast':self.camera.reset(ids)
+        if self.cfg.camera_backend=='raycast':
+            active_ids=ids[self.camera.active_camera_mask[ids]]
+            if len(active_ids):self.camera.reset(active_ids)
         elif len(camera_ids):self.camera.reset(camera_ids)
         self.episode_length_buf[ids]=0; self.scene.env_origins[ids]=self.core.env_origins[ids]
         if hasattr(self,'depth_age'):self.depth_age[camera_ids]=0

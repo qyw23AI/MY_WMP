@@ -14,7 +14,7 @@ parser.add_argument('--save_interval',type=int,default=100)
 parser.add_argument('--rollout_steps',type=int,default=24)
 parser.add_argument('--terrain',choices=['plane','mixed','robocon','robocon_mixed','gap_training','plum_stones','platform_plum_combo','plum_stones_flat','tire_array','high_wall','platform','ramp','platform_gap','gap_combos','stair_gap','stair_gap_ramp'],default='mixed')
 parser.add_argument('--competition_stage',choices=['learn','standard','eval'],default='learn')
-parser.add_argument('--episode_seconds',type=float,default=None,help='Episode limit: 45s for competition courses, 20s for plane/mixed')
+parser.add_argument('--episode_seconds',type=float,default=None,help='Episode limit in seconds (default: 20s for all terrains)')
 parser.add_argument('--wm_batch',type=int,default=2)
 parser.add_argument('--wm_length',type=int,default=16)
 parser.add_argument('--wm_start',type=int,default=256)
@@ -50,7 +50,7 @@ parser.add_argument('--seconds',type=float,default=30.,help='Playback wall secon
 parser.add_argument('--play_steps',type=int,default=0,help='Playback control steps; overrides wall seconds when positive')
 AppLauncher.add_app_launcher_args(parser); args=parser.parse_args(); args.enable_cameras=args.camera_backend=='rtx'
 if args.episode_seconds is None:
-    args.episode_seconds=20. if args.terrain in ('plane','mixed') else 45.
+    args.episode_seconds=20.
 if args.episode_seconds<=0:parser.error('--episode_seconds must be positive')
 if args.num_envs<4:parser.error('Use at least 4 environments for WMP terrain sampling')
 if args.camera_envs is None:
